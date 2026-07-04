@@ -8,7 +8,7 @@ import WorkerMonitor from './WorkerMonitor.jsx';
 import DLQView from './DLQView.jsx';
 import './styles.css';
 
-const API = '';
+const API = import.meta.env.VITE_API_URL || '';
 
 const TABS = [
   { id: 'dashboard', label: 'Dashboard', icon: '📊' },
