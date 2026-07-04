@@ -9,7 +9,7 @@ services:
     name: codity-api
     env: node
     buildCommand: npm install && npm run migrate && npm run seed
-    startCommand: npm run start:api
+    startCommand: npm run start:reaper & npm run start:worker & npm run start:api
     plan: free
     envVars:
       - key: DATABASE_URL
@@ -20,27 +20,3 @@ services:
         generateValue: true
       - key: FRONTEND_ORIGIN
         value: "*" # Set this to your Vercel URL once deployed for better security!
-        
-  - type: worker
-    name: codity-worker
-    env: node
-    buildCommand: npm install
-    startCommand: npm run start:worker
-    plan: free
-    envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: codity-db
-          property: connectionString
-
-  - type: worker
-    name: codity-reaper
-    env: node
-    buildCommand: npm install
-    startCommand: npm run start:reaper
-    plan: free
-    envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: codity-db
-          property: connectionString
