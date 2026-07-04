@@ -72,6 +72,7 @@ maybe('reaper requeues a running job after a worker is killed', async () => {
       return running.rows[0].count === 1;
     });
     first.kill('SIGKILL');
+    await new Promise(resolve => setTimeout(resolve, 200)); // Ensure worker is fully terminated
     await query(`UPDATE worker_heartbeats SET last_seen_at=now() - interval '35 seconds'`);
     const result = await reapOnce();
     assert.equal(result.requeued, 1);

@@ -6,7 +6,7 @@ import rateLimit from 'express-rate-limit';
 import { Server } from 'socket.io';
 import cron from 'node-cron';
 import bcrypt from 'bcryptjs';
-import { query } from '../db/pool.js';
+import { pool, query } from '../db/pool.js';
 import { requireAuth, requireRole, signToken } from '../lib/auth.js';
 import { bus, emitJobChange, wakeWorkers } from '../lib/events.js';
 import { claimSql } from '../lib/claim.js';
@@ -103,29 +103,35 @@ app.patch('/api/queues/:id/:action(pause|resume)', writeLimiter, requireRole('ad
 });
 
 app.post('/api/jobs', writeLimiter, async (req, res) => {
-  const { queue_id, type = 'immediate', payload = {}, priority = 0, run_at, cron_expr } = req.body;
-  if (type === 'recurring') {
-    const nextRunAt = run_at ? new Date(run_at) : new Date();
+  try {
+    const { queue_id, type = 'immediate', payload = {}, priority = 0, run_at, cron_expr } = req.body;
+    if (!queue_id || isNaN(Number(queue_id))) return res.status(400).json({ error: 'valid queue_id is required' });
+    if (type === 'recurring') {
+      const nextRunAt = run_at ? new Date(run_at) : new Date();
+      const { rows } = await query(
+        `INSERT INTO scheduled_jobs(queue_id, cron_expr, payload, next_run_at) VALUES ($1,$2,$3,$4) RETURNING *`,
+        [queue_id, cron_expr || '* * * * *', payload, nextRunAt]
+      );
+      return res.status(201).json(rows[0]);
+    }
+    const scheduled = type === 'scheduled' || type === 'delayed';
+    const jobRunAt = run_at ? new Date(run_at) : new Date();
     const { rows } = await query(
-      `INSERT INTO scheduled_jobs(queue_id, cron_expr, payload, next_run_at) VALUES ($1,$2,$3,$4) RETURNING *`,
-      [queue_id, cron_expr || '* * * * *', payload, nextRunAt]
+      `INSERT INTO jobs(queue_id, type, payload, status, priority, run_at)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [queue_id, type, payload, scheduled && jobRunAt > new Date() ? 'scheduled' : 'queued', priority, jobRunAt]
     );
-    return res.status(201).json(rows[0]);
+    if (jobRunAt <= new Date()) {
+      wakeWorkers(queue_id);
+      await notifyWake(queue_id);
+    }
+    emitJobChange(rows[0]);
+    await notifyJob(rows[0]);
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('Job creation failed:', err);
+    res.status(500).json({ error: err.message || 'Failed to create job' });
   }
-  const scheduled = type === 'scheduled' || type === 'delayed';
-  const jobRunAt = run_at ? new Date(run_at) : new Date();
-  const { rows } = await query(
-    `INSERT INTO jobs(queue_id, type, payload, status, priority, run_at)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [queue_id, type, payload, scheduled && jobRunAt > new Date() ? 'scheduled' : 'queued', priority, jobRunAt]
-  );
-  if (jobRunAt <= new Date()) {
-    wakeWorkers(queue_id);
-    await notifyWake(queue_id);
-  }
-  emitJobChange(rows[0]);
-  await notifyJob(rows[0]);
-  res.status(201).json(rows[0]);
 });
 
 app.get('/api/jobs', async (req, res) => {
@@ -134,14 +140,114 @@ app.get('/api/jobs', async (req, res) => {
   if (req.query.status) { params.push(req.query.status); clauses.push(`j.status=$${params.length}`); }
   if (req.query.queue_id) { params.push(req.query.queue_id); clauses.push(`j.queue_id=$${params.length}`); }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  const { rows } = await query(`SELECT j.*, q.name AS queue_name FROM jobs j JOIN queues q ON q.id=j.queue_id ${where} ORDER BY j.run_at DESC LIMIT 200`, params);
+  const page = Math.max(1, Number(req.query.page || 1));
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+  const offset = (page - 1) * limit;
+  params.push(limit); const limitIdx = params.length;
+  params.push(offset); const offsetIdx = params.length;
+  const { rows } = await query(
+    `SELECT j.*, q.name AS queue_name FROM jobs j JOIN queues q ON q.id=j.queue_id ${where} ORDER BY j.created_at DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+    params
+  );
+  const countParams = params.slice(0, params.length - 2);
+  const total = await query(`SELECT count(*)::int AS count FROM jobs j ${where}`, countParams);
+  res.json({ rows, total: total.rows[0].count, page, limit });
+});
+
+app.get('/api/jobs/:id', async (req, res) => {
+  const { rows: jobs } = await query(`SELECT j.*, q.name AS queue_name FROM jobs j JOIN queues q ON q.id=j.queue_id WHERE j.id=$1`, [req.params.id]);
+  if (!jobs[0]) return res.status(404).json({ error: 'job not found' });
+  const [executions, logs] = await Promise.all([
+    query(`SELECT * FROM job_executions WHERE job_id=$1 ORDER BY started_at DESC`, [req.params.id]),
+    query(`SELECT * FROM job_logs WHERE job_id=$1 ORDER BY created_at DESC LIMIT 100`, [req.params.id])
+  ]);
+  res.json({ ...jobs[0], executions: executions.rows, logs: logs.rows });
+});
+
+app.get('/api/dlq', async (req, res) => {
+  const { rows } = await query(
+    `SELECT d.*, j.queue_id, j.type, j.payload, j.attempt_count, j.created_at AS job_created_at, q.name AS queue_name
+     FROM dead_letter_queue d
+     JOIN jobs j ON j.id=d.job_id
+     JOIN queues q ON q.id=j.queue_id
+     ORDER BY d.moved_at DESC LIMIT 100`
+  );
   res.json(rows);
+});
+
+app.post('/api/dlq/:jobId/retry', writeLimiter, requireRole('admin'), async (req, res) => {
+  const { rows: jobs } = await query(
+    `UPDATE jobs SET status='queued', attempt_count=0, claimed_by=NULL, claimed_at=NULL, run_at=now()
+     WHERE id=$1 AND status='dead' RETURNING *`,
+    [req.params.jobId]
+  );
+  if (!jobs[0]) return res.status(404).json({ error: 'dead job not found' });
+  await query(`DELETE FROM dead_letter_queue WHERE job_id=$1`, [req.params.jobId]);
+  emitJobChange(jobs[0]);
+  await notifyJob(jobs[0]);
+  await notifyWake(jobs[0].queue_id);
+  res.json(jobs[0]);
+});
+
+app.patch('/api/queues/:id', writeLimiter, requireRole('admin'), async (req, res) => {
+  const { priority, concurrency_limit, name } = req.body;
+  const sets = []; const params = [];
+  if (priority !== undefined) { params.push(priority); sets.push(`priority=$${params.length}`); }
+  if (concurrency_limit !== undefined) { params.push(concurrency_limit); sets.push(`concurrency_limit=$${params.length}`); }
+  if (name !== undefined) { params.push(name); sets.push(`name=$${params.length}`); }
+  if (!sets.length) return res.status(400).json({ error: 'nothing to update' });
+  params.push(req.params.id);
+  const { rows } = await query(`UPDATE queues SET ${sets.join(',')} WHERE id=$${params.length} RETURNING *`, params);
+  if (!rows[0]) return res.status(404).json({ error: 'queue not found' });
+  res.json(rows[0]);
+});
+
+app.patch('/api/retry-policies/:queueId', writeLimiter, requireRole('admin'), async (req, res) => {
+  const { strategy, max_attempts, base_delay_ms } = req.body;
+  const sets = []; const params = [];
+  if (strategy !== undefined) { params.push(strategy); sets.push(`strategy=$${params.length}`); }
+  if (max_attempts !== undefined) { params.push(max_attempts); sets.push(`max_attempts=$${params.length}`); }
+  if (base_delay_ms !== undefined) { params.push(base_delay_ms); sets.push(`base_delay_ms=$${params.length}`); }
+  if (!sets.length) return res.status(400).json({ error: 'nothing to update' });
+  params.push(req.params.queueId);
+  const { rows } = await query(`UPDATE retry_policies SET ${sets.join(',')} WHERE queue_id=$${params.length} RETURNING *`, params);
+  if (!rows[0]) return res.status(404).json({ error: 'retry policy not found' });
+  res.json(rows[0]);
+});
+
+app.get('/api/metrics', async (_req, res) => {
+  const [statusCounts, hourly, queueStats, avgDuration] = await Promise.all([
+    query(`SELECT status, count(*)::int AS count FROM jobs GROUP BY status`),
+    query(`SELECT date_trunc('hour', created_at) AS hour, status, count(*)::int AS count
+           FROM jobs WHERE created_at > now() - interval '24 hours'
+           GROUP BY hour, status ORDER BY hour`),
+    query(`SELECT q.id, q.name, q.status,
+             count(j.id)::int AS total_jobs,
+             count(*) FILTER (WHERE j.status='completed')::int AS completed,
+             count(*) FILTER (WHERE j.status='dead')::int AS dead,
+             count(*) FILTER (WHERE j.status IN ('queued','scheduled','claimed','running'))::int AS active
+           FROM queues q LEFT JOIN jobs j ON j.queue_id=q.id GROUP BY q.id ORDER BY q.name`),
+    query(`SELECT round(avg(EXTRACT(EPOCH FROM (finished_at - started_at)) * 1000))::int AS avg_ms
+           FROM job_executions WHERE finished_at IS NOT NULL`)
+  ]);
+  res.json({
+    statusCounts: statusCounts.rows,
+    hourly: hourly.rows,
+    queueStats: queueStats.rows,
+    avgDurationMs: avgDuration.rows[0]?.avg_ms || 0
+  });
 });
 
 app.post('/api/admin/claim/:queueId', writeLimiter, requireRole('admin'), async (req, res) => {
   const workerId = req.body.worker_id || 0;
   const { rows } = await query(claimSql, [workerId, req.params.queueId]);
   res.json(rows[0] || null);
+});
+
+/* ═══ Global Error Handler ═══ */
+app.use((err, _req, res, _next) => {
+  console.error('unhandled route error:', err);
+  res.status(err.status || 500).json({ error: err.message || 'internal server error' });
 });
 
 cron.schedule('* * * * * *', async () => {
@@ -169,3 +275,15 @@ cron.schedule('* * * * * *', async () => {
 const port = Number(process.env.PORT || 4000);
 await startDbEventListener();
 server.listen(port, () => console.log(`api listening on ${port}`));
+
+/* ═══ Graceful Shutdown ═══ */
+async function shutdown() {
+  console.log('shutting down api...');
+  server.close();
+  await pool.end();
+  process.exit(0);
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+

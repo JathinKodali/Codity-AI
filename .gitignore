@@ -1,5 +1,5 @@
 node_modules/
+frontend/dist/
 dist/
 .env
-coverage/
-npm-debug.log*
+*.log

@@ -22,14 +22,26 @@ async function registerWorker() {
 }
 
 async function heartbeat(workerId, status = 'idle') {
-  const { rows } = await query(
+  let activeId = workerId;
+  let { rows } = await query(
     `UPDATE workers SET status=$2 WHERE id=$1 RETURNING *`,
-    [workerId, status]
+    [activeId, status]
   );
+  if (!rows[0]) {
+    console.log(`Worker ID ${activeId} not found in database. Re-registering...`);
+    const newWorker = await registerWorker();
+    worker = newWorker;
+    activeId = newWorker.id;
+    const retry = await query(
+      `UPDATE workers SET status=$2 WHERE id=$1 RETURNING *`,
+      [activeId, status]
+    );
+    rows = retry.rows;
+  }
   await query(
     `INSERT INTO worker_heartbeats(worker_id, last_seen_at) VALUES ($1, now())
      ON CONFLICT (worker_id) DO UPDATE SET last_seen_at=now()`,
-    [workerId]
+    [activeId]
   );
   await notifyWorker(rows[0]);
 }
@@ -103,7 +115,7 @@ async function poll(workerId) {
   for (const queue of queues) await claimForQueue(workerId, queue);
 }
 
-const worker = await registerWorker();
+let worker = await registerWorker();
 const heartbeatTimer = setInterval(() => heartbeat(worker.id, inflight.size ? 'busy' : 'idle').catch(console.error), 5000);
 const pollTimer = setInterval(() => poll(worker.id).catch(console.error), pollMs);
 await poll(worker.id);

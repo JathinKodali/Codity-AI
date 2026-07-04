@@ -9,11 +9,11 @@
     "start:reaper": "node src/worker/reaper.js",
     "dev:api": "nodemon src/api/server.js",
     "dev:worker": "nodemon src/worker/worker.js",
-    "dev:frontend": "vite frontend --host 127.0.0.1",
+    "dev:frontend": "vite",
     "migrate": "node src/db/migrate.js",
     "seed": "node src/db/seed.js",
     "test": "node --test test/*.test.js",
-    "build": "vite build frontend"
+    "build": "vite build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.1",
